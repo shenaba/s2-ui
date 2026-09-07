@@ -165,7 +165,11 @@ const Data = defineStore('Data', {
       }
       return <Client>{}
     },
-    async save (object: string, action: string, data: any, initUsers?: number[]): Promise<boolean> {
+    // refresh=false is for a caller writing several objects in a row. The
+    // reload below is a full api/load, and every save invalidates the server's
+    // config cache, so N saves would mean N full config rebuilds. Such a caller
+    // passes false and reloads once when it is done.
+    async save (object: string, action: string, data: any, initUsers?: number[], refresh = true): Promise<boolean> {
       const postData = {
         object: object,
         action: action,
@@ -195,7 +199,7 @@ const Data = defineStore('Data', {
         // one's refresh gated out (see loadData), and the websocket push that
         // would eventually repair it is exactly what a closed socket does not
         // deliver.
-        await this.loadData(true)
+        if (refresh) await this.loadData(true)
       }
       return msg.success
     },
