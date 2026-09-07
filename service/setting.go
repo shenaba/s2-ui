@@ -767,6 +767,9 @@ func (s *SettingService) Save(tx *gorm.DB, data json.RawMessage) error {
 			if err != nil {
 				return err
 			}
+			// The per-inbound totals are seeded from those rows; drop them so
+			// they are rebuilt from whatever this transaction leaves behind.
+			InvalidateInboundTraffic()
 		}
 		err = tx.Model(model.Setting{}).Where("key = ?", key).Update("value", obj).Error
 		if err != nil {

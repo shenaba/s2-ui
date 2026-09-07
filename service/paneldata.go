@@ -89,6 +89,10 @@ func (s *PanelDataService) onlinesHalf() (map[string]interface{}, error) {
 	// so omitting it once nobody is over their limit would leave the last
 	// non-empty counts on screen forever.
 	data["ipCounts"] = GetIPCounts()
+	// Rides the live payload for the same reason client up/down does: it moves
+	// with traffic, not with config, so carrying it on the config half would
+	// freeze it until the next save.
+	data["inboundTraffic"] = s.StatsService.GetInboundTraffic()
 	return data, nil
 }
 
