@@ -432,14 +432,24 @@ type SaveResult struct {
 func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (*SaveResult, error) {
 	var err error
 	var savedIds []uint
+	// Set once the change row is in; the deferred commit is what publishes it.
+	var dt int64
 
 	db := database.GetDB()
 	tx := db.Begin()
 	defer func() {
 		if err == nil {
 			tx.Commit()
-			// Only now is the write visible on the hub's own connection.
-			NotifyConfigChanged()
+			// Marks the change and wakes the hub, and both halves have to
+			// happen after the commit. The hub reads on its own pooled
+			// connection, so notifying earlier publishes a pre-commit view.
+			// The mark is also what invalidates the config cache, and the DB
+			// runs in WAL -- a reader racing the commit sees the old snapshot
+			// rather than blocking -- so marking earlier let such a reader
+			// cache the pre-change config under the post-change key and serve
+			// it for the whole TTL, outliving the push that would repair it
+			// (same entry, same cseq, so the SPA drops it as not newer).
+			SetLastUpdate(dt)
 			// Try to start core if it is not running
 			if !corePtr.IsRunning() {
 				s.StartCore()
@@ -500,7 +510,7 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		return nil, err
 	}
 
-	dt := time.Now().Unix()
+	dt = time.Now().Unix()
 	err = tx.Create(&model.Changes{
 		DateTime: dt,
 		Actor:    loginUser,
@@ -511,8 +521,6 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 	if err != nil {
 		return nil, err
 	}
-
-	MarkLastUpdate(dt)
 
 	return &SaveResult{Object: obj, Action: act, Ids: savedIds}, nil
 }

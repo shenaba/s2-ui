@@ -312,12 +312,15 @@ func (s *NodeSyncService) AdoptInbounds(nodeId uint, tags []string, actor string
 		if err := tx.Model(model.Node{}).Where("id = ?", nodeId).Update("dirty", true).Error; err != nil {
 			return err
 		}
-		MarkLastUpdate(time.Now().Unix())
 		return nil
 	})
 	if err == nil {
-		// Only now is the write visible on the hub's own connection.
-		NotifyConfigChanged()
+		// Marked and notified only now, and for the same reason: gorm commits
+		// after the closure returns, so marking inside it would let a reader
+		// racing that commit cache an inbound list without the new replica
+		// rows -- under the post-change key, so it would stand for the whole
+		// TTL and swallow the push this call makes.
+		SetLastUpdate(time.Now().Unix())
 	}
 	return err
 }

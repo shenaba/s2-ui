@@ -797,22 +797,29 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 	// reset, so notifying unconditionally is not free: the hub answers with a
 	// full config push and the SPA swaps its whole config object for the new
 	// one, throwing away whatever the operator had typed into the rules/DNS/
-	// settings pages but not saved yet. Both write paths below already mark
-	// LastUpdate exactly when they wrote something -- follow that same
-	// condition instead of announcing an idle round.
+	// settings pages but not saved yet. Both write paths below report exactly
+	// when they wrote something -- follow that condition instead of announcing
+	// an idle round.
 	// Collected inside the transaction, published after it commits: an alert
 	// about a client that a rollback left enabled would simply be false.
 	var depleted []model.Client
 	var expiring []expiringClient
 
-	seqBefore := lastUpdateSeq.Load()
+	// Set by whichever branch below actually wrote. Both used to call
+	// MarkLastUpdate from inside the transaction, which is the one thing this
+	// must not do: the mark is what invalidates the config cache, and a reader
+	// racing the commit sees the pre-commit snapshot rather than blocking (WAL),
+	// so it would cache the pre-change rows under the post-change key and serve
+	// them for the whole TTL -- outliving the push that follows, which lands
+	// on that same entry and is dropped by the SPA as not newer.
+	var marked bool
 	tx := db.Begin()
 	defer func() {
 		if err == nil {
 			tx.Commit()
 			// Only now is the write visible on the hub's own connection.
-			if lastUpdateSeq.Load() != seqBefore {
-				NotifyConfigChanged()
+			if marked {
+				SetLastUpdate(dt)
 			}
 			if err1 := db.Exec("PRAGMA wal_checkpoint(FULL)").Error; err1 != nil {
 				logger.Error("Error checkpointing WAL: ", err1.Error())
@@ -824,7 +831,7 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 	}()
 
 	// Reset clients
-	inboundIds, enableChanged, err = s.ResetClients(tx, dt)
+	inboundIds, enableChanged, marked, err = s.ResetClients(tx, dt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -871,7 +878,7 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		MarkLastUpdate(dt)
+		marked = true
 	}
 
 	return inboundIds, enableChanged, nil
@@ -1015,7 +1022,7 @@ func publishClientEvents(depleted []model.Client, expiring []expiringClient) {
 // local inbound ids (to hot-restart) and the names it re-enabled, which the
 // caller has to fan out to nodes for the same reason DepleteJob fans out a
 // disable: the node keeps rejecting a paid-up user until it hears otherwise.
-func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, error) {
+func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, bool, error) {
 	var err error
 	var resetClients, allClients []*model.Client
 	var changes []model.Changes
@@ -1025,7 +1032,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("enable = true AND delay_start = true AND auto_reset = false AND (Up + Down) > 0").Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.Expiry = dt + (int64(client.ResetDays) * 86400)
@@ -1044,7 +1051,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("enable = true AND delay_start = true AND auto_reset = true AND (Up + Down) > 0").Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.NextReset = dt + (int64(client.ResetDays) * 86400)
@@ -1063,7 +1070,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("delay_start = false AND auto_reset = true AND next_reset < ?", dt).Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.NextReset = dt + (int64(client.ResetDays) * 86400)
@@ -1085,7 +1092,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	if len(allClients) > 0 {
 		err = tx.Save(allClients).Error
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
@@ -1093,18 +1100,21 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	if len(changes) > 0 {
 		err = tx.Model(model.Changes{}).Create(&changes).Error
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
-	// Mark on any write, not only on the ones that log a Changes row: the
+	// Reported on any write, not only on the ones that log a Changes row: the
 	// periodic-reset branch rewrites counters and can flip Enable back on
-	// without recording a change, and DepleteClients gates its hub notify on
-	// this mark. Without it a re-enabled client stays greyed out in every open
-	// panel while sing-box is already letting it back in.
-	if len(allClients) > 0 || len(changes) > 0 {
-		MarkLastUpdate(dt)
-	}
-	return inboundIds, reenabled, nil
+	// without recording a change, and DepleteClients gates both its mark and
+	// its hub notify on this. Without it a re-enabled client stays greyed out
+	// in every open panel while sing-box is already letting it back in.
+	//
+	// Reported rather than marked here: a mark invalidates the config cache,
+	// and the caller's transaction is still open, so marking now would let a
+	// reader racing that commit cache the pre-change rows under the
+	// post-change key.
+	wrote := len(allClients) > 0 || len(changes) > 0
+	return inboundIds, reenabled, wrote, nil
 }
 
 // ResetAllClientsTraffic zeroes up/down for every client (accumulating into the
