@@ -111,8 +111,15 @@ const Data = defineStore('Data', {
       }
       return true
     },
-    async loadData() {
-      const msg = await HttpUtils.get('api/load', this.lastLoad >0 ? {lu: this.lastLoad} : {} )
+    // ignoreLu skips the server's change gate. That gate has one-second
+    // granularity and compares strictly (`cur > lu`), so a refresh issued in the
+    // same wall-clock second as the change it is meant to pick up is answered
+    // with the live payload instead -- clients only, no config half. Fine for the
+    // periodic reads this was written for; wrong for a read that exists to
+    // observe a specific write, which is why save() passes true.
+    async loadData(ignoreLu = false) {
+      const lu = ignoreLu ? 0 : this.lastLoad
+      const msg = await HttpUtils.get('api/load', lu > 0 ? { lu } : {})
       // The HTTP response omits nodesStatus when there are no nodes but means
       // "none" — the seed key keeps that reset; spreading obj over it restores
       // the real value whenever the backend did send one.
@@ -158,7 +165,11 @@ const Data = defineStore('Data', {
       }
       return <Client>{}
     },
-    async save (object: string, action: string, data: any, initUsers?: number[]): Promise<boolean> {
+    // refresh=false is for a caller writing several objects in a row. The
+    // reload below is a full api/load, and every save invalidates the server's
+    // config cache, so N saves would mean N full config rebuilds. Such a caller
+    // passes false and reloads once when it is done.
+    async save (object: string, action: string, data: any, initUsers?: number[], refresh = true): Promise<boolean> {
       const postData = {
         object: object,
         action: action,
@@ -173,7 +184,22 @@ const Data = defineStore('Data', {
           duration: 5000,
           message: i18n.global.t('actions.' + action) + " " + i18n.global.t('objects.' + objectName)
         })
-        this.setNewData(msg.obj)
+        // The save reply now describes the write, not the new panel state -- it
+        // carries the rows it touched and nothing else. Refresh through the read
+        // endpoint, which is the only thing that can produce the derived fields:
+        // an inbound's user count is a join computed per read, so no merge of the
+        // returned rows could keep the inbounds list honest.
+        //
+        // Awaited so the caller still resolves with the store already updated,
+        // and not left to the websocket's 200ms debounce -- the list has to be
+        // right the moment the drawer closes, and a closed socket would mean
+        // never. loadData failing does not unmake the save, so success stands.
+        //
+        // ignoreLu: two saves inside one second would otherwise leave the second
+        // one's refresh gated out (see loadData), and the websocket push that
+        // would eventually repair it is exactly what a closed socket does not
+        // deliver.
+        if (refresh) await this.loadData(true)
       }
       return msg.success
     },

@@ -729,7 +729,8 @@ const save = async () => {
       duration: 5000,
       message: i18n.global.t('actions.set') + " " + i18n.global.t('pages.settings')
     })
-    setData(msg.obj.settings)
+    // 保存的响应只描述这次写了什么,不再回带整份设置——重新读一次。
+    await loadData()
   }
   loading.value = false
 }

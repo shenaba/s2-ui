@@ -412,17 +412,44 @@ func (s *ConfigService) CheckOutbound(tag string, link string) core.CheckOutboun
 	return core.CheckOutbound(corePtr.GetCtx(), tag, link)
 }
 
-func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) ([]string, error) {
+// SaveResult describes what a save wrote -- never what a caller should read
+// next. The panel used to get a list of tables to refresh back from here, which
+// is how a write ended up answering with the whole client list: a view concern
+// decided a service return value. Refreshing is api/load's job now.
+//
+// Ids covers the primary object only. A tls edit also rewrites client links and
+// an inbound edit touches clients, but naming every knock-on row would make this
+// a change feed, and nothing needs one -- the panel reloads, and an integrator
+// saving a certificate is not waiting to hear which links moved.
+type SaveResult struct {
+	Object string `json:"object"`
+	Action string `json:"action"`
+	// Rows written, or removed for a delete. Only clients reports these today;
+	// the other services would each need their own id plumbing.
+	Ids []uint `json:"ids,omitempty"`
+}
+
+func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (*SaveResult, error) {
 	var err error
-	var objs []string = []string{obj}
+	var savedIds []uint
+	// Set once the change row is in; the deferred commit is what publishes it.
+	var dt int64
 
 	db := database.GetDB()
 	tx := db.Begin()
 	defer func() {
 		if err == nil {
 			tx.Commit()
-			// Only now is the write visible on the hub's own connection.
-			NotifyConfigChanged()
+			// Marks the change and wakes the hub, and both halves have to
+			// happen after the commit. The hub reads on its own pooled
+			// connection, so notifying earlier publishes a pre-commit view.
+			// The mark is also what invalidates the config cache, and the DB
+			// runs in WAL -- a reader racing the commit sees the old snapshot
+			// rather than blocking -- so marking earlier let such a reader
+			// cache the pre-change config under the post-change key and serve
+			// it for the whole TTL, outliving the push that would repair it
+			// (same entry, same cseq, so the SPA drops it as not newer).
+			SetLastUpdate(dt)
 			// Try to start core if it is not running
 			if !corePtr.IsRunning() {
 				s.StartCore()
@@ -434,21 +461,21 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 
 	switch obj {
 	case "clients":
-		var inboundIds []uint
-		inboundIds, err = s.ClientService.Save(tx, act, data, hostname)
-		if err == nil && len(inboundIds) > 0 {
-			objs = append(objs, "inbounds")
-			err = s.InboundService.UpdateInboundsUsers(tx, inboundIds)
-			if err != nil {
-				return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
+		var write *ClientWrite
+		write, err = s.ClientService.Save(tx, act, data, hostname)
+		if err == nil {
+			savedIds = write.Ids
+			if len(write.InboundIds) > 0 {
+				err = s.InboundService.UpdateInboundsUsers(tx, write.InboundIds)
+				if err != nil {
+					return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
+				}
 			}
 		}
 	case "tls":
 		err = s.TlsService.Save(tx, act, data, hostname)
-		objs = append(objs, "clients", "inbounds")
 	case "inbounds":
 		err = s.InboundService.Save(tx, act, data, initUsers, hostname)
-		objs = append(objs, "clients")
 	case "outbounds":
 		err = s.OutboundService.Save(tx, act, data)
 	case "services":
@@ -483,7 +510,7 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		return nil, err
 	}
 
-	dt := time.Now().Unix()
+	dt = time.Now().Unix()
 	err = tx.Create(&model.Changes{
 		DateTime: dt,
 		Actor:    loginUser,
@@ -495,9 +522,7 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 		return nil, err
 	}
 
-	MarkLastUpdate(dt)
-
-	return objs, nil
+	return &SaveResult{Object: obj, Action: act, Ids: savedIds}, nil
 }
 
 // SetLastUpdate records a config-change timestamp and wakes the websocket

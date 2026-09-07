@@ -136,14 +136,26 @@ const saveChanges = async () => {
   })
 
   // save data
+  //
+  // Sequential and awaited. forEach(async ...) started every save at once and
+  // then dropped loading before any of them answered, which re-enabled the save
+  // button (Btn disables itself while loading) with the batch still in flight --
+  // a second click re-ran the whole batch, and checkTag could not stop it,
+  // because the store had not been refreshed with the rows just written.
+  //
+  // Each save also refreshes the whole panel and invalidates the server's config
+  // cache, so a subscription with fifty outbounds meant fifty full config
+  // rebuilds -- hence refresh=false here and one reload at the end.
   loading.value = true
-  outbounds.value.forEach(async (o: Outbound, index: number) => {
-    if (outChecks.value[index] == 2) return
+  let saved = false
+  for (let index = 0; index < outbounds.value.length; index++) {
+    if (outChecks.value[index] == 2) continue
     outChecks.value[index] = 3
-    const success = await Data().save('outbounds', 'new', o)
-    if (success) outChecks.value[index] = 1
-    else outChecks.value[index] = 2
-  })
+    const success = await Data().save('outbounds', 'new', outbounds.value[index], undefined, false)
+    outChecks.value[index] = success ? 1 : 2
+    if (success) saved = true
+  }
+  if (saved) await Data().loadData(true)
   loading.value = false
 }
 

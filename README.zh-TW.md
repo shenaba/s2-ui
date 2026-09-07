@@ -244,6 +244,10 @@ GitHub 也會提示。Linux 上（systemd 或 Docker）點一下即可原地升�
 帶上 `sync=true` 時，才會觸發 Web UI 那種立即下發到各節點的行為；未帶該參數時，用戶端
 與入站的變更仍會透過每小時一次的對帳安全網收斂。
 
+`save` 的回應描述這次寫了什麼，而不是面板的新狀態：包含 object、action 與被變更
+資料列的 id；當 object 為 `clients` 且動作是單筆的 `new` 或 `edit` 時，還會附上完整資料列
+（含產生的 `links`）。其餘資料請透過 `apiv2/clients` 等讀取端點取得。
+
 </details>
 
 ## 網域與憑證

@@ -192,19 +192,22 @@ func TestConfigCacheUsable(t *testing.T) {
 		t.Error("an empty cache must never be served")
 	}
 	if !configCacheUsable(true, host, host, 7, 7, fresh) {
-		t.Error("same host, same LastUpdate, inside the TTL: should be served")
+		t.Error("same host, no write since, inside the TTL: should be served")
 	}
 	// subURI is derived from the hostname, so an entry built for one host would
 	// hand the wrong subscription link to another.
 	if configCacheUsable(true, host, "other.example", 7, 7, fresh) {
 		t.Error("a different hostname must rebuild")
 	}
-	// The load-bearing one: any write bumps LastUpdate, and missing this would
-	// serve the pre-change config to every reconnect for the whole TTL.
+	// The load-bearing one: every write marks, and missing this would serve the
+	// pre-change config to every reconnect for the whole TTL. The key is the
+	// mark COUNT, not LastUpdate -- see
+	// TestConfigCacheRebuildsForASecondWriteInTheSameSecond for why seconds are
+	// not enough.
 	if configCacheUsable(true, host, host, 7, 8, fresh) {
-		t.Error("a bumped LastUpdate must rebuild")
+		t.Error("a write since this entry was built must rebuild")
 	}
-	// Backstop for a write path that forgets to bump: staleness stays bounded
+	// Backstop for a write path that forgets to mark: staleness stays bounded
 	// by the TTL instead of lasting until the next real change.
 	if configCacheUsable(true, host, host, 7, 7, configCacheTTL) {
 		t.Error("an entry at the TTL boundary must rebuild")

@@ -73,9 +73,19 @@ func (s *ClientService) GetAllWithConfig() (*[]model.Client, error) {
 	return &clients, nil
 }
 
-func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, hostname string) ([]uint, error) {
+// ClientWrite reports what a client save actually did: the rows it wrote (or
+// deleted) and the inbounds whose live user table has to be refreshed. Both are
+// []uint and mean different things, so they travel named rather than as two
+// bare return values a call site could quietly swap.
+type ClientWrite struct {
+	Ids        []uint
+	InboundIds []uint
+}
+
+func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, hostname string) (*ClientWrite, error) {
 	var err error
 	var inboundIds []uint
+	var savedIds []uint
 
 	switch act {
 	case "new", "edit":
@@ -89,6 +99,9 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		// from, and the master never pushes one (the name is the map key).
 		if err = normalizeClientName(&client); err != nil {
 			return nil, err
+		}
+		if act == "new" {
+			defaultClientJSONFields(&client)
 		}
 		if act == "edit" {
 			// Only a name actually changing is validated, so a duplicate that
@@ -142,6 +155,8 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
+		// After the write: on a create the id is assigned by the insert.
+		savedIds = []uint{client.Id}
 	case "addbulk":
 		var clients []*model.Client
 		err = json.Unmarshal(data, &clients)
@@ -158,6 +173,7 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 			if err = normalizeClientName(client); err != nil {
 				return nil, err
 			}
+			defaultClientJSONFields(client)
 			if seen[client.Name] {
 				return nil, common.NewErrorf("duplicate client name in this batch: %q", client.Name)
 			}
@@ -191,6 +207,7 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
+		savedIds = clientIds(clients)
 	case "editbulk":
 		var clients []*model.Client
 		err = json.Unmarshal(data, &clients)
@@ -268,6 +285,7 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
+		savedIds = clientIds(clients)
 	case "delbulk":
 		var ids []uint
 		err = json.Unmarshal(data, &ids)
@@ -291,6 +309,7 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
+		savedIds = ids
 	case "del":
 		var id uint
 		err = json.Unmarshal(data, &id)
@@ -310,11 +329,20 @@ func (s *ClientService) Save(tx *gorm.DB, act string, data json.RawMessage, host
 		if err != nil {
 			return nil, err
 		}
+		savedIds = []uint{id}
 	default:
 		return nil, common.NewErrorf("unknown action: %s", act)
 	}
 
-	return inboundIds, nil
+	return &ClientWrite{Ids: savedIds, InboundIds: inboundIds}, nil
+}
+
+func clientIds(clients []*model.Client) []uint {
+	ids := make([]uint, 0, len(clients))
+	for _, client := range clients {
+		ids = append(ids, client.Id)
+	}
+	return ids
 }
 
 // normalizeClientName trims the name in place and rejects an empty one.
@@ -336,6 +364,30 @@ func normalizeClientName(client *model.Client) error {
 		return common.NewError("client name must not be empty")
 	}
 	return nil
+}
+
+// defaultClientJSONFields fills the json.RawMessage columns a create may omit.
+//
+// Both are unmarshalled unconditionally on the create path -- Links by
+// updateLinksWithFixedInbounds, Inbounds right after it -- and json.Unmarshal on
+// a nil RawMessage fails with "unexpected end of JSON input", an error naming
+// neither the field nor the request. The panel never hits it because its own
+// forms always send both; an API caller creating a client has nothing to put in
+// links and no reason to guess it is mandatory.
+//
+// Create only, deliberately. On an edit these carry state nothing else can
+// recover: an absent inbounds would read as "remove from every inbound", and an
+// absent links would drop the external entries the payload is the only source of
+// (node-owned ones re-attach from the stored row, user-authored ones do not). An
+// explicit empty array is a different thing and still means what it says -- it
+// is two bytes, so it never reaches this.
+func defaultClientJSONFields(client *model.Client) {
+	if len(client.Links) == 0 {
+		client.Links = json.RawMessage("[]")
+	}
+	if len(client.Inbounds) == 0 {
+		client.Inbounds = json.RawMessage("[]")
+	}
 }
 
 // ensureNameAvailable rejects a duplicate client name. The name is the cluster's
@@ -745,22 +797,29 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 	// reset, so notifying unconditionally is not free: the hub answers with a
 	// full config push and the SPA swaps its whole config object for the new
 	// one, throwing away whatever the operator had typed into the rules/DNS/
-	// settings pages but not saved yet. Both write paths below already mark
-	// LastUpdate exactly when they wrote something -- follow that same
-	// condition instead of announcing an idle round.
+	// settings pages but not saved yet. Both write paths below report exactly
+	// when they wrote something -- follow that condition instead of announcing
+	// an idle round.
 	// Collected inside the transaction, published after it commits: an alert
 	// about a client that a rollback left enabled would simply be false.
 	var depleted []model.Client
 	var expiring []expiringClient
 
-	seqBefore := lastUpdateSeq.Load()
+	// Set by whichever branch below actually wrote. Both used to call
+	// MarkLastUpdate from inside the transaction, which is the one thing this
+	// must not do: the mark is what invalidates the config cache, and a reader
+	// racing the commit sees the pre-commit snapshot rather than blocking (WAL),
+	// so it would cache the pre-change rows under the post-change key and serve
+	// them for the whole TTL -- outliving the push that follows, which lands
+	// on that same entry and is dropped by the SPA as not newer.
+	var marked bool
 	tx := db.Begin()
 	defer func() {
 		if err == nil {
 			tx.Commit()
 			// Only now is the write visible on the hub's own connection.
-			if lastUpdateSeq.Load() != seqBefore {
-				NotifyConfigChanged()
+			if marked {
+				SetLastUpdate(dt)
 			}
 			if err1 := db.Exec("PRAGMA wal_checkpoint(FULL)").Error; err1 != nil {
 				logger.Error("Error checkpointing WAL: ", err1.Error())
@@ -772,7 +831,7 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 	}()
 
 	// Reset clients
-	inboundIds, enableChanged, err = s.ResetClients(tx, dt)
+	inboundIds, enableChanged, marked, err = s.ResetClients(tx, dt)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -819,7 +878,7 @@ func (s *ClientService) DepleteClients() ([]uint, []string, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		MarkLastUpdate(dt)
+		marked = true
 	}
 
 	return inboundIds, enableChanged, nil
@@ -963,7 +1022,7 @@ func publishClientEvents(depleted []model.Client, expiring []expiringClient) {
 // local inbound ids (to hot-restart) and the names it re-enabled, which the
 // caller has to fan out to nodes for the same reason DepleteJob fans out a
 // disable: the node keeps rejecting a paid-up user until it hears otherwise.
-func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, error) {
+func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, bool, error) {
 	var err error
 	var resetClients, allClients []*model.Client
 	var changes []model.Changes
@@ -973,7 +1032,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("enable = true AND delay_start = true AND auto_reset = false AND (Up + Down) > 0").Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.Expiry = dt + (int64(client.ResetDays) * 86400)
@@ -992,7 +1051,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("enable = true AND delay_start = true AND auto_reset = true AND (Up + Down) > 0").Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.NextReset = dt + (int64(client.ResetDays) * 86400)
@@ -1011,7 +1070,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	err = tx.Model(model.Client{}).
 		Where("delay_start = false AND auto_reset = true AND next_reset < ?", dt).Find(&resetClients).Error
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	for _, client := range resetClients {
 		client.NextReset = dt + (int64(client.ResetDays) * 86400)
@@ -1033,7 +1092,7 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	if len(allClients) > 0 {
 		err = tx.Save(allClients).Error
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
@@ -1041,18 +1100,21 @@ func (s *ClientService) ResetClients(tx *gorm.DB, dt int64) ([]uint, []string, e
 	if len(changes) > 0 {
 		err = tx.Model(model.Changes{}).Create(&changes).Error
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
-	// Mark on any write, not only on the ones that log a Changes row: the
+	// Reported on any write, not only on the ones that log a Changes row: the
 	// periodic-reset branch rewrites counters and can flip Enable back on
-	// without recording a change, and DepleteClients gates its hub notify on
-	// this mark. Without it a re-enabled client stays greyed out in every open
-	// panel while sing-box is already letting it back in.
-	if len(allClients) > 0 || len(changes) > 0 {
-		MarkLastUpdate(dt)
-	}
-	return inboundIds, reenabled, nil
+	// without recording a change, and DepleteClients gates both its mark and
+	// its hub notify on this. Without it a re-enabled client stays greyed out
+	// in every open panel while sing-box is already letting it back in.
+	//
+	// Reported rather than marked here: a mark invalidates the config cache,
+	// and the caller's transaction is still open, so marking now would let a
+	// reader racing that commit cache the pre-change rows under the
+	// post-change key.
+	wrote := len(allClients) > 0 || len(changes) > 0
+	return inboundIds, reenabled, wrote, nil
 }
 
 // ResetAllClientsTraffic zeroes up/down for every client (accumulating into the

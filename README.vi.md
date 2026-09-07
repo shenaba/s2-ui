@@ -263,6 +263,12 @@ chính node sở hữu chúng.
 request có kèm `sync=true`; không có nó, thay đổi về client và inbound vẫn sẽ hội tụ
 qua đợt đối soát mỗi giờ.
 
+Phản hồi của `save` mô tả những gì đã được ghi, không phải trạng thái mới của bảng
+điều khiển: nó gồm `object`, `action` và id của các dòng bị thay đổi; khi `object`
+là `clients` và hành động là `new` hoặc `edit` đơn lẻ, phản hồi còn kèm toàn bộ dòng client (gồm
+cả `links` được sinh ra). Phần còn lại hãy lấy qua các endpoint đọc như
+`apiv2/clients`.
+
 </details>
 
 ## Tên miền và chứng chỉ

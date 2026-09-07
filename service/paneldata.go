@@ -108,19 +108,28 @@ func (s *PanelDataService) LivePayload() (map[string]interface{}, error) {
 // without an lu, and once per distinct hostname on every config push. Caching
 // it against the change timestamp collapses a burst of those into one build.
 //
-// Invalidation is the timestamp, not the clock: every write path bumps
-// LastUpdate, so a change is visible on the next call. The TTL is only a
-// backstop -- if some future write forgets to bump, staleness is bounded by it
-// instead of being permanent. Deliberately a single entry: hostname varies only
-// with how the panel is reached, and an unbounded map would be attacker-growable
-// through the Host header wherever DomainValidator is not pinning it.
+// Invalidation keys on lastUpdateSeq -- the count of marks -- and NOT on
+// lastUpdate. Both move together on every write, but lastUpdate is unix
+// SECONDS: two writes inside one second store the same value, so an entry built
+// between them still compared equal and the second write's config was served
+// from the pre-write snapshot for the rest of the TTL. That is not academic --
+// the panel refreshes through this path right after a save, and the websocket
+// push that would repair it lands 200ms later, inside the same TTL, on the same
+// stale entry. The counter has no such collision; the hazard is spelled out
+// where it is declared (see lastUpdateSeq in config.go).
+//
+// The TTL is only a backstop -- if some future write forgets to mark, staleness
+// is bounded by it instead of being permanent. Deliberately a single entry:
+// hostname varies only with how the panel is reached, and an unbounded map would
+// be attacker-growable through the Host header wherever DomainValidator is not
+// pinning it.
 const configCacheTTL = 2 * time.Second
 
 var configCache struct {
 	mu       sync.Mutex
 	valid    bool
 	hostname string
-	luKey    int64  // the LastUpdate this entry was built against
+	markKey  int64  // the lastUpdateSeq this entry was built against
 	stamp    int64  // the lu served alongside it
 	seq      uint64 // the config version served alongside it
 	builtAt  time.Time
@@ -154,7 +163,7 @@ func NextConfigSeq() uint64 {
 // configCacheUsable is the whole staleness decision, kept pure so it can be
 // verified without a database. Serving a stale config is the one way this cache
 // can break the panel, so every reason to rebuild is spelled out here.
-func configCacheUsable(valid bool, cachedHost, host string, cachedLu, curLu int64, age time.Duration) bool {
+func configCacheUsable(valid bool, cachedHost, host string, cachedMarks, curMarks int64, age time.Duration) bool {
 	if !valid {
 		return false
 	}
@@ -163,7 +172,7 @@ func configCacheUsable(valid bool, cachedHost, host string, cachedLu, curLu int6
 		// wrong for another.
 		return false
 	}
-	if cachedLu != curLu {
+	if cachedMarks != curMarks {
 		return false // a write landed
 	}
 	return age >= 0 && age < configCacheTTL
@@ -173,11 +182,14 @@ func configCacheUsable(valid bool, cachedHost, host string, cachedLu, curLu int6
 // config version that belong with it. The returned map is shared and must not
 // be mutated -- callers copy out of it.
 func (s *PanelDataService) configHalf(hostname string) (map[string]interface{}, int64, uint64, error) {
-	cur := lastUpdate.Load()
+	// Read before the lock and before the reads below: a write landing after
+	// this is not represented in the entry we are about to build, and the next
+	// call must rebuild rather than trust it.
+	marks := lastUpdateSeq.Load()
 	configCache.mu.Lock()
 	defer configCache.mu.Unlock()
 	if configCacheUsable(configCache.valid, configCache.hostname, hostname,
-		configCache.luKey, cur, time.Since(configCache.builtAt)) {
+		configCache.markKey, marks, time.Since(configCache.builtAt)) {
 		return configCache.data, configCache.stamp, configCache.seq, nil
 	}
 
@@ -247,7 +259,7 @@ func (s *PanelDataService) configHalf(hostname string) (map[string]interface{}, 
 
 	configCache.valid = true
 	configCache.hostname = hostname
-	configCache.luKey = cur
+	configCache.markKey = marks
 	configCache.stamp = stamp
 	configCache.seq = seq
 	configCache.builtAt = time.Now()
