@@ -151,13 +151,13 @@ const listenOf = (item: any): string =>
   item.listen_port ? `${item.listen ?? ''}:${item.listen_port}` : '—'
 const usersTitle = (item: any): string | undefined =>
   item.users && item.users.length > 0 ? item.users.join('\n') : undefined
-const trafficOf = (item: any): string => {
-  if (!item.users) return '—'
-  const total = (dataStore.clients ?? [])
-    .filter((c: any) => item.users.includes(c.name))
-    .reduce((sum: number, c: any) => sum + (c.up ?? 0) + (c.down ?? 0), 0)
-  return HumanReadable.sizeFormat(total)
-}
+// The core counts each inbound separately, and that is the figure to show.
+// Summing the inbound's clients instead gave every inbound that shares a client
+// the same number, because a client's up/down is its total across all of the
+// inbounds it belongs to. A node replica is measured on its node, which reports
+// per client only, so there is nothing to show for one here.
+const trafficOf = (item: any): string =>
+  item.node_id ? '—' : HumanReadable.sizeFormat(dataStore.inboundTraffic[item.tag] ?? 0)
 
 // ---------------- drawer ----------------
 const drawer = ref({ visible: false, id: 0 })
