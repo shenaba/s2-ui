@@ -263,6 +263,12 @@ belong to.
 request carries `sync=true`; without it, client/inbound changes still converge
 through the hourly reconcile safety net.
 
+`save` answers with what the write did, not with the new panel state: the
+object, the action, and the ids of the rows it touched — plus the full client
+rows (generated `links` included) when the object is `clients` and the action is
+a single-row `new` or `edit`. Fetch anything else through the read endpoints, e.g.
+`apiv2/clients`.
+
 </details>
 
 ## Domains & Certificates

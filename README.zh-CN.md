@@ -244,6 +244,10 @@ rm /usr/bin/s-ui
 带上 `sync=true` 时，才会触发 Web UI 那种立即下发到各节点的行为；不带该参数时，客户端
 和入站的改动仍会通过每小时一次的兜底对账收敛。
 
+`save` 的响应描述这次写了什么，而不是面板的新状态：包含 object、action 以及被改动
+行的 id；当 object 为 `clients` 且动作是单条的 `new` 或 `edit` 时，还会带上完整行（含生成的
+`links`）。其余数据请通过 `apiv2/clients` 等读取端点获取。
+
 </details>
 
 ## 域名与证书

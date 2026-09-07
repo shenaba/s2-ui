@@ -412,9 +412,26 @@ func (s *ConfigService) CheckOutbound(tag string, link string) core.CheckOutboun
 	return core.CheckOutbound(corePtr.GetCtx(), tag, link)
 }
 
-func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) ([]string, error) {
+// SaveResult describes what a save wrote -- never what a caller should read
+// next. The panel used to get a list of tables to refresh back from here, which
+// is how a write ended up answering with the whole client list: a view concern
+// decided a service return value. Refreshing is api/load's job now.
+//
+// Ids covers the primary object only. A tls edit also rewrites client links and
+// an inbound edit touches clients, but naming every knock-on row would make this
+// a change feed, and nothing needs one -- the panel reloads, and an integrator
+// saving a certificate is not waiting to hear which links moved.
+type SaveResult struct {
+	Object string `json:"object"`
+	Action string `json:"action"`
+	// Rows written, or removed for a delete. Only clients reports these today;
+	// the other services would each need their own id plumbing.
+	Ids []uint `json:"ids,omitempty"`
+}
+
+func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initUsers string, loginUser string, hostname string) (*SaveResult, error) {
 	var err error
-	var objs []string = []string{obj}
+	var savedIds []uint
 
 	db := database.GetDB()
 	tx := db.Begin()
@@ -434,21 +451,21 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 
 	switch obj {
 	case "clients":
-		var inboundIds []uint
-		inboundIds, err = s.ClientService.Save(tx, act, data, hostname)
-		if err == nil && len(inboundIds) > 0 {
-			objs = append(objs, "inbounds")
-			err = s.InboundService.UpdateInboundsUsers(tx, inboundIds)
-			if err != nil {
-				return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
+		var write *ClientWrite
+		write, err = s.ClientService.Save(tx, act, data, hostname)
+		if err == nil {
+			savedIds = write.Ids
+			if len(write.InboundIds) > 0 {
+				err = s.InboundService.UpdateInboundsUsers(tx, write.InboundIds)
+				if err != nil {
+					return nil, common.NewErrorf("failed to update users for inbounds: %v", err)
+				}
 			}
 		}
 	case "tls":
 		err = s.TlsService.Save(tx, act, data, hostname)
-		objs = append(objs, "clients", "inbounds")
 	case "inbounds":
 		err = s.InboundService.Save(tx, act, data, initUsers, hostname)
-		objs = append(objs, "clients")
 	case "outbounds":
 		err = s.OutboundService.Save(tx, act, data)
 	case "services":
@@ -497,7 +514,7 @@ func (s *ConfigService) Save(obj string, act string, data json.RawMessage, initU
 
 	MarkLastUpdate(dt)
 
-	return objs, nil
+	return &SaveResult{Object: obj, Action: act, Ids: savedIds}, nil
 }
 
 // SetLastUpdate records a config-change timestamp and wakes the websocket

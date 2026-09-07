@@ -38,6 +38,127 @@ func newTestDB(t *testing.T) *gorm.DB {
 }
 
 // A node push must never be blocked by a name the node happens to use locally:
+// An API caller creating a client has nothing to put in links, and the error it
+// used to get named neither the field nor the request: json.Unmarshal on a nil
+// RawMessage says "unexpected end of JSON input". The panel never hit it because
+// its own forms always send both fields.
+func TestCreateAcceptsOmittedLinksAndInbounds(t *testing.T) {
+	db := newTestDB(t)
+	var svc ClientService
+
+	t.Run("new without links or inbounds", func(t *testing.T) {
+		data := json.RawMessage(`{"name":"lean","config":{}}`)
+		write, err := svc.Save(db, "new", data, "example.com")
+		if err != nil {
+			t.Fatalf("create rejected a payload with no links/inbounds: %v", err)
+		}
+		var stored model.Client
+		if err := db.Where("name = ?", "lean").First(&stored).Error; err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if string(stored.Links) != "[]" {
+			t.Errorf("links stored as %q, want []", stored.Links)
+		}
+		if string(stored.Inbounds) != "[]" {
+			t.Errorf("inbounds stored as %q, want []", stored.Inbounds)
+		}
+		if len(write.Ids) != 1 || write.Ids[0] != stored.Id {
+			t.Errorf("reported %v, row is %d", write.Ids, stored.Id)
+		}
+	})
+
+	t.Run("addbulk without links or inbounds", func(t *testing.T) {
+		data := json.RawMessage(`[{"name":"lean-a","config":{}},{"name":"lean-b","config":{}}]`)
+		if _, err := svc.Save(db, "addbulk", data, "example.com"); err != nil {
+			t.Fatalf("addbulk rejected a payload with no links/inbounds: %v", err)
+		}
+	})
+
+	// An edit is deliberately NOT defaulted: an absent inbounds would read as
+	// "remove from every inbound" and an absent links would drop the external
+	// entries the payload is the only source of. Failing is the safe answer.
+	t.Run("edit is left alone", func(t *testing.T) {
+		var stored model.Client
+		if err := db.Where("name = ?", "lean").First(&stored).Error; err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		data := json.RawMessage(`{"id":` + strconv.FormatUint(uint64(stored.Id), 10) + `,"name":"lean","config":{}}`)
+		if _, err := svc.Save(db, "edit", data, "example.com"); err == nil {
+			t.Error("edit silently accepted an omitted links/inbounds")
+		}
+	})
+}
+
+// The save reply is built from these ids, so a create that does not report the
+// row it inserted leaves an API caller with no way to name what it just made --
+// which is the whole reason the reply stopped being the full client list.
+func TestSaveReportsTheRowsItWrote(t *testing.T) {
+	db := newTestDB(t)
+	var svc ClientService
+
+	var created uint
+	t.Run("new reports the id the insert assigned", func(t *testing.T) {
+		data := json.RawMessage(`{"name":"a","group":"user","inbounds":[],"links":[],"config":{}}`)
+		write, err := svc.Save(db, "new", data, "example.com")
+		if err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(write.Ids) != 1 {
+			t.Fatalf("expected one written row, got %v", write.Ids)
+		}
+		var stored model.Client
+		if err := db.Where("name = ?", "a").First(&stored).Error; err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if write.Ids[0] != stored.Id {
+			t.Errorf("reported id %d, row is %d", write.Ids[0], stored.Id)
+		}
+		created = stored.Id
+	})
+
+	t.Run("edit reports the same row", func(t *testing.T) {
+		data := json.RawMessage(`{"id":` + strconv.FormatUint(uint64(created), 10) +
+			`,"name":"a2","group":"user","inbounds":[],"links":[],"config":{}}`)
+		write, err := svc.Save(db, "edit", data, "example.com")
+		if err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(write.Ids) != 1 || write.Ids[0] != created {
+			t.Errorf("expected [%d], got %v", created, write.Ids)
+		}
+	})
+
+	t.Run("addbulk reports every inserted row", func(t *testing.T) {
+		data := json.RawMessage(`[{"name":"b","group":"user","inbounds":[],"links":[],"config":{}},` +
+			`{"name":"c","group":"user","inbounds":[],"links":[],"config":{}}]`)
+		write, err := svc.Save(db, "addbulk", data, "example.com")
+		if err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(write.Ids) != 2 {
+			t.Fatalf("expected two written rows, got %v", write.Ids)
+		}
+		for _, id := range write.Ids {
+			if id == 0 {
+				t.Errorf("addbulk reported an unassigned id: %v", write.Ids)
+			}
+		}
+	})
+
+	// Deleted rows cannot be read back, so the ids are the only answer there --
+	// and they are what the reply carries in place of a client object.
+	t.Run("del reports the removed row", func(t *testing.T) {
+		data := json.RawMessage(strconv.FormatUint(uint64(created), 10))
+		write, err := svc.Save(db, "del", data, "example.com")
+		if err != nil {
+			t.Fatalf("save: %v", err)
+		}
+		if len(write.Ids) != 1 || write.Ids[0] != created {
+			t.Errorf("expected [%d], got %v", created, write.Ids)
+		}
+	})
+}
+
 // runReconcile aborts the WHOLE round on a failed push, so one collision would
 // stop that node syncing entirely — worse than the duplicate the check prevents.
 func TestSaveNameCheckExemptsClusterPush(t *testing.T) {

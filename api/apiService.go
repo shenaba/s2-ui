@@ -12,6 +12,7 @@ import (
 
 	"github.com/shenaba/2s-ui/config"
 	"github.com/shenaba/2s-ui/database"
+	"github.com/shenaba/2s-ui/database/model"
 	"github.com/shenaba/2s-ui/logger"
 	"github.com/shenaba/2s-ui/service"
 	"github.com/shenaba/2s-ui/service/notify"
@@ -467,7 +468,7 @@ func (a *ApiService) Save(c *gin.Context, loginUser string, fanout bool, hostnam
 	act := c.Request.FormValue("action")
 	data := c.Request.FormValue("data")
 	initUsers := c.Request.FormValue("initUsers")
-	objs, err := a.ConfigService.Save(obj, act, json.RawMessage(data), initUsers, loginUser, hostname)
+	result, err := a.ConfigService.Save(obj, act, json.RawMessage(data), initUsers, loginUser, hostname)
 	if err != nil {
 		jsonMsg(c, "save", err)
 		return
@@ -478,10 +479,61 @@ func (a *ApiService) Save(c *gin.Context, loginUser string, fanout bool, hostnam
 		a.NodeSyncService.MarkAllDirty()
 		go a.NodeSyncService.ReconcileDirtyOnline()
 	}
-	err = a.LoadPartialData(c, objs)
+	resp, err := a.savedRows(result)
 	if err != nil {
 		jsonMsg(c, obj, err)
+		return
 	}
+	jsonObj(c, resp, nil)
+}
+
+// savedRows answers a write with the rows it wrote. This endpoint used to reply
+// by running the read endpoint over every table the change had touched, so
+// creating one client returned every client and every inbound -- a payload
+// shaped by what the SPA needed to repaint, paid for by every API caller. The
+// panel refreshes itself through api/load now.
+//
+// Clients come back as the whole row rather than the list projection: config
+// and links are generated here (links especially -- the caller cannot build
+// them), and a create that made the caller fetch them separately would just be
+// the old round trip in a different place.
+//
+// Single-row writes only. A bulk action touches every row the caller submitted,
+// and whole rows carry config and links -- so answering editbulk over a selected
+// "all" would serialise the entire client table with its credentials and every
+// generated link, larger than the payload this endpoint stopped sending and
+// discarded unread by the panel, which reloads. Bulk callers get ids, which is
+// the part they could not reconstruct; the rows are one read away. Deletes carry
+// ids only for the same reason plus a simpler one: there is nothing left to read.
+func (a *ApiService) savedRows(r *service.SaveResult) (map[string]interface{}, error) {
+	resp := map[string]interface{}{
+		"object": r.Object,
+		"action": r.Action,
+	}
+	if len(r.Ids) > 0 {
+		resp["ids"] = r.Ids
+	}
+	if r.Object == "clients" && len(r.Ids) > 0 && (r.Action == "new" || r.Action == "edit") {
+		ids := make([]string, 0, len(r.Ids))
+		for _, id := range r.Ids {
+			ids = append(ids, strconv.FormatUint(uint64(id), 10))
+		}
+		clients, err := a.ClientService.Get(strings.Join(ids, ","))
+		if err != nil {
+			return nil, err
+		}
+		// A row can be gone by the time this read runs -- a concurrent delete,
+		// or the depletion cron -- and the scan leaves a nil slice, which
+		// marshals as null. Answer with an empty array instead: the field's type
+		// must not depend on a race, or a caller indexing into it crashes on the
+		// one response it did not expect.
+		rows := []model.Client{}
+		if clients != nil {
+			rows = append(rows, *clients...)
+		}
+		resp["clients"] = rows
+	}
+	return resp, nil
 }
 
 func (a *ApiService) RestartApp(c *gin.Context) {
