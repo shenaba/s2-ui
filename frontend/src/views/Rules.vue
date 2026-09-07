@@ -278,7 +278,13 @@ const findNeighbor = computed({
 })
 
 const dhcpLeaseFiles = computed({
-  get: (): string => route.value.dhcp_lease_files?.join(',') ?? '',
+  // Listable in sing-box, so a single path is legal as a bare string -- and the
+  // config need not have been written by this panel. Calling join on it throws
+  // during render, which blanks the whole page rather than one field.
+  get: (): string => {
+    const v = route.value.dhcp_lease_files
+    return Array.isArray(v) ? v.join(',') : v ?? ''
+  },
   set: (v: string) => {
     const parts = v.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0)
     if (parts.length > 0) route.value.dhcp_lease_files = parts

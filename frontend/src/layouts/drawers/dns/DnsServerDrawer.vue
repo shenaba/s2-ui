@@ -175,7 +175,14 @@ const WithoutDial: string[] = [
 const server = ref<any>(createDnsServer('local', { tag: 'dns-' + RandomUtil.randomSeq(3) }))
 
 const neighborDomain = computed({
-  get: (): string => server.value.neighbor_domain?.join(',') ?? '',
+  // Listable in sing-box, so a single domain is legal as a bare string -- and
+  // the config need not have been written by this panel (a restored DB, an
+  // apiv2 config write). Calling join on it throws and takes the drawer down
+  // with it; hostsPath below guards `path` the same way.
+  get: (): string => {
+    const v = server.value.neighbor_domain
+    return Array.isArray(v) ? v.join(',') : v ?? ''
+  },
   set: (v: string) => {
     const parts = v.split(',').map((s: string) => s.trim()).filter((s: string) => s.length > 0)
     if (parts.length > 0) server.value.neighbor_domain = parts
